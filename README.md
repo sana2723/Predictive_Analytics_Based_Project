@@ -1,12 +1,15 @@
-**Project: Credit Risk Modeling — Predictive Analytics & NLP
-Goal: Reduce loan defaults by proactively identifying risky customers and improving decision reliability.
-Dataset: 5000 records, 16 variables (Customer_ID, Credit_Amount, Purpose..., Default_On_Payment). Source: your uploaded Data Dictionary. 
+****Project: Credit Risk Modeling — Predictive Analytics & NLP**
 
-3.Data-Dictionary-Case-Study**
+**Goal: Reduce loan defaults by proactively identifying risky customers and improving decision reliability.**
 
-**Approach:
 
-Exploratory Data Ana**lysis
+**Dataset: 5000 records, 16 variables (Customer_ID, Credit_Amount, Purpose..., Default_On_Payment). Source: your uploaded Data Dictionary**
+
+**3.Data-Dictionary-Case-Study****
+
+****Approach:**
+
+**Exploratory Data Analysis**
 
 Feature engineering (log transforms, payment estimates, age bins, interactions)
 
