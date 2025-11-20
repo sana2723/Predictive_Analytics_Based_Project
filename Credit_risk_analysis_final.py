@@ -349,14 +349,259 @@ print("Saved test_with_predictions.csv - ready for Tableau import")
 # ---------------------------
 # 13) FINAL NOTES & NEXT STEPS
 # ---------------------------
-print("""
-Pipeline complete.
+### 1) Hyperparameter tuning
+#### 1.A — Optuna example (recommended for XGBoost / CatBoost)
 
-Next recommended steps:
-- Hyperparameter tuning with RandomizedSearchCV or Optuna for XGBoost/CatBoost/RandomForest.
-- Use target encoding (e.g., category_encoders' TargetEncoder) for high-cardinality variables instead of one-hot.
-- Build a calibration model (Platt scaling / isotonic) if predicted probabilities need calibration.
-- Implement model monitoring (population drift, score distribution) in production.
-- If required, implement ROSE via R or rpy2.
-- If deploying, package the best pipeline into a Docker image and expose a prediction API (FastAPI).
-""")
+#### Drop this into your script/notebook (uses StratifiedKFold CV and AUC as objective):
+
+
+# optuna_tuning.py (snippet)
+import optuna
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+import numpy as np
+
+def tune_xgb(X, y, preprocessor, n_trials=40, n_jobs=1, random_state=42):
+    import xgboost as xgb
+    from sklearn.pipeline import Pipeline
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 10.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
+            "random_state": random_state,
+            "use_label_encoder": False,
+            "eval_metric": "auc",
+            "n_jobs": n_jobs
+        }
+        model = xgb.XGBClassifier(**params)
+        pipe = Pipeline([("pre", preprocessor), ("clf", model)])
+        scores = cross_val_score(pipe, X, y, scoring="roc_auc", cv=skf, n_jobs=1)
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=random_state))
+    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+    print("Best params:", study.best_params)
+    return study.best_params
+
+# Usage:
+# best_params = tune_xgb(X_train, y_train, preprocessor, n_trials=50)
+
+
+### 1.B — RandomizedSearchCV example for RandomForest (faster / simpler)
+
+from sklearn.model_selection import RandomizedSearchCV
+from scipy.stats import randint
+rf = RandomForestClassifier(random_state=42, n_jobs=-1)
+param_dist = {
+    'n_estimators': randint(100, 800),
+    'max_depth': randint(3, 20),
+    'min_samples_split': randint(2, 20),
+    'min_samples_leaf': randint(1, 10),
+    'max_features': ['sqrt', 'log2', None]
+}
+search = RandomizedSearchCV(rf, param_distributions=param_dist, n_iter=40, scoring='roc_auc', cv=5, random_state=42, n_jobs=-1)
+from sklearn.pipeline import Pipeline
+pipe = Pipeline([('pre', preprocessor), ('clf', search)])
+pipe.fit(X_train, y_train)  # this will run randomized search as part of fit
+best_rf = search.best_estimator_
+print("RF best params:", search.best_params_)
+
+
+
+### 2) Target Encoding for high-cardinality categoricals
+
+##### Use category_encoders.TargetEncoder (better than OHE for many categories). Replace the categorical_transformer in your ColumnTransformer with TargetEncoder pipeline.
+
+# target_encoding_snippet.py
+from category_encoders import TargetEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+
+high_cardinality = ['Customer_ID']  # example if any; replace with actual high-card cols
+cat_cols = [c for c in categorical_cols if c not in high_cardinality]
+te_cols = [c for c in categorical_cols if c in high_cardinality]
+
+numeric_transformer = Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
+
+cat_ohe_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))
+])
+
+target_enc_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('target_enc', TargetEncoder())
+])
+
+transformers = []
+if numeric_cols:
+    transformers.append(('num', numeric_transformer, numeric_cols))
+if cat_cols:
+    transformers.append(('cat_ohe', cat_ohe_transformer, cat_cols))
+if te_cols:
+    transformers.append(('cat_te', target_enc_transformer, te_cols))
+
+preprocessor_te = ColumnTransformer(transformers=transformers, remainder='drop', verbose_feature_names_out=False)
+
+
+### Notes
+
+#### When using TargetEncoder, do the encoding inside cross-validation folds (wrap encoder in pipeline as above) to avoid leakage — the pipeline approach prevents leakage.
+
+#### For very rare categories consider grouping them to "other" or smoothing parameters provided by TargetEncoder.
+
+## 3) Probability calibration (Platt / Isotonic)
+
+#### If business requires well-calibrated probability estimates (common in credit scoring), use CalibratedClassifierCV.
+
+
+from sklearn.calibration import CalibratedClassifierCV
+
+# Suppose best_model is your trained classifier (un-calibrated)
+base_pipe = Pipeline([('pre', preprocessor), ('clf', xgb.XGBClassifier(**best_params))])
+# Use cv='prefit' if you already fit the model; otherwise use cv=5 to train internal folds
+calibrated = CalibratedClassifierCV(base_estimator=base_pipe.named_steps['clf'], method='isotonic', cv=5)  # or method='sigmoid' for Platt
+# If using pipeline, easier to create a pipeline where 'clf' is the calibrated classifier:
+cal_pipe = Pipeline([('pre', preprocessor), ('clf', calibrated)])
+# Fit on train
+cal_pipe.fit(X_train, y_train)
+# Save
+joblib.dump(cal_pipe, "calibrated_pipeline.joblib")
+# Evaluate
+y_proba = cal_pipe.predict_proba(X_test)[:,1]
+from sklearn.calibration import calibration_curve
+prob_true, prob_pred = calibration_curve(y_test, y_proba, n_bins=10)
+
+
+## 4) Model monitoring utilities (PSI, KS, drift check, score distribution)
+
+#### Drop-in functions you can run periodically (daily/weekly) to detect distribution shifts.
+
+# monitoring_utils.py
+import numpy as np
+import pandas as pd
+from scipy.stats import ks_2samp
+
+def psi(expected_array, actual_array, buckets=10):
+    """
+    Population Stability Index (PSI)
+    expected_array: reference (train) scores/feature
+    actual_array: new (production) scores/feature
+    """
+    def _get_breaks(arr, nb):
+        return np.linspace(0, 1, nb+1)
+    breaks = np.percentile(expected_array, np.linspace(0,100,buckets+1))
+    expected_perc = np.histogram(expected_array, bins=breaks)[0] / len(expected_array)
+    actual_perc = np.histogram(actual_array, bins=breaks)[0] / len(actual_array)
+    # avoid zeros
+    actual_perc = np.where(actual_perc == 0, 1e-8, actual_perc)
+    expected_perc = np.where(expected_perc == 0, 1e-8, expected_perc)
+    psi_val = np.sum((expected_perc - actual_perc) * np.log(expected_perc / actual_perc))
+    return psi_val
+
+def ks_test_feature(ref, new):
+    # returns D statistic and p-value
+    return ks_2samp(ref, new)
+
+def score_distribution_report(ref_scores, new_scores):
+    psi_val = psi(ref_scores, new_scores)
+    ks_stat, pvalue = ks_test_feature(ref_scores, new_scores)
+    report = {
+        "psi": float(psi_val),
+        "ks_stat": float(ks_stat),
+        "ks_pvalue": float(pvalue)
+    }
+    return report
+
+# Example usage:
+# ref = best_pipe.predict_proba(X_train)[:,1]
+# new = prod_pipe.predict_proba(X_prod_sample)[:,1]
+# print(score_distribution_report(ref, new))
+
+
+
+## 5) ROSE in Python via rpy2 (if you need ROSE specifically)
+
+#### ROSE is an R package (Random Over-Sampling Examples). Use rpy2 to call R from Python.
+
+# rose_rpy2_snippet.py
+# Make sure R installed and R package 'ROSE' installed: in R -> install.packages("ROSE")
+from rpy2 import robjects
+from rpy2.robjects import pandas2ri
+pandas2ri.activate()
+
+robjects.r('library(ROSE)')  # will error if not installed
+
+def rose_resample_py(df, target_col):
+    """
+    df: pandas.DataFrame (training data including target)
+    target_col: name of binary target column
+    returns: balanced pandas DataFrame
+    """
+    r_df = pandas2ri.py2rpy(df)
+    robjects.globalenv['r_df'] = r_df
+    robjects.globalenv['target_col'] = target_col
+    robjects.r('''
+        df = r_df
+        target = as.factor(df[[target_col]])
+        # ROSE will generate synthetic observations
+        rose_out = ROSE(as.formula(paste(target_col, "~ .")), data=df, seed=1)$data
+    ''')
+    res = pandas2ri.rpy2py(robjects.r('rose_out'))
+    return res
+
+# Usage:
+# train_df = pd.concat([X_train, y_train.rename('target')], axis=1)
+# balanced = rose_resample_py(train_df, 'target')
+
+
+
+### 6) FastAPI + Docker for serving model
+
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+import joblib
+import pandas as pd
+
+app = FastAPI(title="Credit Risk Model API")
+
+# load at startup
+MODEL_PATH = "model_xgb.joblib"  # replace with your best saved pipeline
+pipe = joblib.load(MODEL_PATH)
+
+class PredictRequest(BaseModel):
+    data: list  # list of dicts, each dict is one row with column names matching training features
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    df = pd.DataFrame(req.data)
+    # optional: basic validation
+    preds_proba = pipe.predict_proba(df)[:,1].tolist()
+    preds = pipe.predict(df).tolist()
+    return {"pred_proba": preds_proba, "pred": preds}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+## 6.B — Dockerfile
+
+# Dockerfile
+# FROM python:3.10-slim
+
+# WORKDIR /app
+# COPY requirements.txt /app/requirements.txt
+# RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# COPY . /app
+
+# EXPOSE 8000
+# CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
